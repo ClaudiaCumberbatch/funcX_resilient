@@ -15,7 +15,23 @@ import responses
 from globus_compute_endpoint import engines
 from globus_compute_endpoint.engines.base import GlobusComputeEngineBase
 from globus_compute_sdk.sdk.web_client import WebClient
+from parsl.addresses import address_by_hostname
+from parsl.monitoring.monitoring import MonitoringHub
 
+# _DEFAULT_MONITORING = MonitoringHub(
+#     hub_address=address_by_hostname(),
+#     hub_port=6553,
+#     resource_monitoring_interval=1,
+# )
+
+def get_monitor(cnt):
+    return MonitoringHub(
+        hub_address=address_by_hostname(),
+        hub_port=cnt,
+        resource_monitoring_interval=1,
+    )
+
+cnt = 1
 
 @pytest.fixture(autouse=True)
 def verify_all_tests_reset_signals():
@@ -120,10 +136,12 @@ def engine_runner(tmp_path, engine_heartbeat, reporting_period=0.1) -> t.Callabl
         elif engine_type is engines.ThreadPoolEngine:
             k = dict(max_workers=2)
         elif engine_type is engines.GlobusComputeEngine:
+            cnt = random.randint(1024, 65535)
             k = dict(
                 address="127.0.0.1",
                 heartbeat_period=engine_heartbeat,
                 heartbeat_threshold=1,
+                monitoring=get_monitor(cnt),
             )
         else:
             raise NotImplementedError(f"Unimplemented: {engine_type.__name__}")

@@ -6,9 +6,19 @@ import pathlib
 import warnings
 
 from globus_compute_endpoint.engines import GlobusComputeEngine
+from parsl.addresses import address_by_hostname
+from parsl.monitoring.monitoring import MonitoringHub
 from parsl.utils import RepresentationMixin
 
 _DEFAULT_EXECUTORS = [GlobusComputeEngine()]
+# _DEFAULT_MONITORING = MonitoringHub(
+#     hub_address=address_by_hostname(),
+#     hub_port=6553,
+#     resource_monitoring_interval=1,
+# )
+# _MONITOR_EXECUTORS = [GlobusComputeEngine(
+#     monitoring=_DEFAULT_MONITORING,
+# )]
 
 
 class Config(RepresentationMixin):
@@ -139,6 +149,7 @@ class Config(RepresentationMixin):
         self,
         # Execution backed
         executors: list = _DEFAULT_EXECUTORS,
+        # executors: list = _MONITOR_EXECUTORS,
         # Connection info
         environment: str | None = None,
         funcx_service_address=None,
@@ -157,6 +168,8 @@ class Config(RepresentationMixin):
         endpoint_teardown: str | None = None,
         force_mu_allow_same_user: bool = False,
         mu_child_ep_grace_period_s: float = 30,
+        # Monitoring
+        monitoring: MonitoringHub | None = None, #= _DEFAULT_MONITORING,
         # Misc info
         display_name: str | None = None,
         # Logging info
@@ -218,6 +231,10 @@ class Config(RepresentationMixin):
 
         self.endpoint_setup = endpoint_setup
         self.endpoint_teardown = endpoint_teardown
+
+        # Monitoring
+        # print("initialize monitor", monitoring)
+        self.monitoring = monitoring
 
         # Logging info
         self.log_dir = log_dir

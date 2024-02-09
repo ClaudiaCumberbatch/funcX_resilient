@@ -1,11 +1,15 @@
+import datetime
+import inspect
 import logging
 import os
 import queue
 import shlex
+import sys
+import threading
 import typing as t
 import uuid
 from concurrent.futures import Future
-
+from getpass import getuser
 from globus_compute_common.messagepack.message_types import (
     EPStatusReport,
     TaskTransition,
@@ -15,7 +19,17 @@ from globus_compute_endpoint.engines.base import (
     ReportingThread,
 )
 from globus_compute_endpoint.strategies import SimpleStrategy
+from parsl.app.futures import DataFuture
+from parsl.dataflow.futures import AppFuture
+from parsl.dataflow.rundirs import make_rundir
+from parsl.dataflow.states import States, FINAL_STATES, FINAL_FAILURE_STATES
+from parsl.dataflow.taskrecord import TaskRecord
 from parsl.executors.high_throughput.executor import HighThroughputExecutor
+from parsl.monitoring.message_type import MessageType
+from parsl.utils import get_version, get_std_fname_mode
+from socket import gethostname
+from typing import Optional
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 DOCKER_CMD_TEMPLATE = "docker run {options} -v {rundir}:{rundir} -t {image} {command}"
@@ -37,6 +51,8 @@ class GlobusComputeEngine(GlobusComputeEngineBase):
         container_type: t.Literal[VALID_CONTAINER_TYPES] = None,  # type: ignore
         container_uri: t.Optional[str] = None,
         container_cmd_options: t.Optional[str] = None,
+        # monitoring
+        monitoring = None,
         **kwargs,
     ):
         """The ``GlobusComputeEngine`` is a shim over `Parsl's HighThroughputExecutor
@@ -89,6 +105,65 @@ class GlobusComputeEngine(GlobusComputeEngineBase):
                 **kwargs,
             )
         self.executor = executor
+
+        self.run_dir = make_rundir('runinfo')
+        self.task_state_counts = {state: 0 for state in States}
+        self.run_id = str(uuid4())
+        self.monitoring = monitoring
+
+         # hub address and port for interchange to connect
+        self.hub_address = None  # type: Optional[str]
+        self.hub_interchange_port = None  # type: Optional[int]
+        if self.monitoring:
+            if self.monitoring.logdir is None:
+                self.monitoring.logdir = self.run_dir
+            self.hub_address = self.monitoring.hub_address
+            self.hub_interchange_port = self.monitoring.start(self.run_id, self.run_dir)
+
+        self.time_began = datetime.datetime.now()
+        self.time_completed: Optional[datetime.datetime] = None
+
+        self.workflow_name = None
+        if self.monitoring is not None and self.monitoring.workflow_name is not None:
+            self.workflow_name = self.monitoring.workflow_name
+        else:
+            for frame in inspect.stack():
+                logger.debug("Considering candidate for workflow name: {}".format(frame.filename))
+                fname = os.path.basename(str(frame.filename))
+                parsl_file_names = ['dflow.py', 'typeguard.py', '__init__.py']
+                # Find first file name not considered a parsl file
+                if fname not in parsl_file_names:
+                    self.workflow_name = fname
+                    logger.debug("Using {} as workflow name".format(fname))
+                    break
+            else:
+                logger.debug("Could not choose a name automatically")
+                self.workflow_name = "unnamed"
+
+        self.workflow_version = str(self.time_began.replace(microsecond=0))
+        if self.monitoring is not None and self.monitoring.workflow_version is not None:
+            self.workflow_version = self.monitoring.workflow_version
+
+        workflow_info = {
+                'python_version': "{}.{}.{}".format(sys.version_info.major,
+                                                    sys.version_info.minor,
+                                                    sys.version_info.micro),
+                'parsl_version': get_version(),
+                "time_began": self.time_began,
+                'time_completed': None,
+                'run_id': self.run_id,
+                'workflow_name': self.workflow_name,
+                'workflow_version': self.workflow_version,
+                'rundir': self.run_dir,
+                'tasks_completed_count': self.task_state_counts[States.exec_done],
+                'tasks_failed_count': self.task_state_counts[States.failed],
+                'user': getuser(),
+                'host': gethostname(),
+        }
+
+        if self.monitoring:
+            self.monitoring.send(MessageType.WORKFLOW_INFO,
+                                 workflow_info)
 
     def containerized_launch_cmd(self) -> str:
         """Recompose executor's launch_cmd to launch with containers
@@ -175,7 +250,93 @@ class GlobusComputeEngine(GlobusComputeEngineBase):
         *args: t.Any,
         **kwargs: t.Any,
     ) -> Future:
+        task_record = self._create_task_record(func, str(uuid4()), *args, **kwargs)
+        task_record['args'] = args
+        task_record['kwargs'] = kwargs
+        self._send_task_log_info(task_record)
         return self.executor.submit(func, {}, *args, **kwargs)
+    
+    def _create_task_record(self, func, task_id, *args, **kwargs):
+        resource_specification = kwargs.get('parsl_resource_specification', {})
+        task_record: TaskRecord
+        task_record = {'depends': [],
+                       'dfk': self,
+                       'executor': self.executor.label,
+                       'func_name': func.__name__,
+                       'memoize': None, #cache,
+                       'hashsum': None,
+                       'exec_fu': None,
+                       'fail_count': 0,
+                       'fail_cost': 0,
+                       'fail_history': [],
+                       'from_memo': None,
+                       'ignore_for_cache': None, #ignore_for_cache,
+                       'join': None, #join,
+                       'joins': None,
+                       'try_id': 0,
+                       'id': task_id,
+                       'task_launch_lock': threading.Lock(),
+                       'time_invoked': datetime.datetime.now(),
+                       'time_returned': None,
+                       'try_time_launched': None,
+                       'try_time_returned': None,
+                       'resource_specification': resource_specification}
+        return task_record
+    
+    def _send_task_log_info(self, task_record: TaskRecord) -> None:
+        if self.monitoring:
+            task_log_info = self._create_task_log_info(task_record)
+            self.monitoring.send(MessageType.TASK_INFO, task_log_info)
+
+    def _create_task_log_info(self, task_record):
+        """
+        Create the dictionary that will be included in the log.
+        """
+        # info_to_monitor = ['func_name', 'memoize', 'hashsum', 'fail_count', 'fail_cost', 'status',
+        info_to_monitor = ['func_name', 'memoize', 'hashsum', 'fail_count', 'fail_cost', 
+                           'id', 'time_invoked', 'try_time_launched', 'time_returned', 'try_time_returned']#, 'executor']
+
+        task_log_info = {"task_" + k: task_record[k] for k in info_to_monitor}
+        task_log_info['run_id'] = self.run_id
+        task_log_info['try_id'] = task_record['try_id']
+        task_log_info['timestamp'] = datetime.datetime.now()
+        # task_log_info['task_status_name'] = task_record['status'].name
+        task_log_info['tasks_failed_count'] = self.task_state_counts[States.failed]
+        task_log_info['tasks_completed_count'] = self.task_state_counts[States.exec_done]
+        task_log_info['tasks_memo_completed_count'] = self.task_state_counts[States.memo_done]
+        task_log_info['from_memo'] = task_record['from_memo']
+        task_log_info['task_inputs'] = str(task_record['kwargs'].get('inputs', None))
+        task_log_info['task_outputs'] = str(task_record['kwargs'].get('outputs', None))
+        task_log_info['task_stdin'] = task_record['kwargs'].get('stdin', None)
+        stdout_spec = task_record['kwargs'].get('stdout', None)
+        stderr_spec = task_record['kwargs'].get('stderr', None)
+        try:
+            stdout_name, _ = get_std_fname_mode('stdout', stdout_spec)
+        except Exception as e:
+            logger.warning("Incorrect stdout format {} for Task {}".format(stdout_spec, task_record['id']))
+            stdout_name = str(e)
+        try:
+            stderr_name, _ = get_std_fname_mode('stderr', stderr_spec)
+        except Exception as e:
+            logger.warning("Incorrect stderr format {} for Task {}".format(stderr_spec, task_record['id']))
+            stderr_name = str(e)
+        task_log_info['task_stdout'] = stdout_name
+        task_log_info['task_stderr'] = stderr_name
+        task_log_info['task_fail_history'] = ",".join(task_record['fail_history'])
+        task_log_info['task_depends'] = None
+        if task_record['depends'] is not None:
+            task_log_info['task_depends'] = ",".join([str(t.tid) for t in task_record['depends']
+                                                      if isinstance(t, AppFuture) or isinstance(t, DataFuture)])
+        task_log_info['task_joins'] = None
+
+        if isinstance(task_record['joins'], list):
+            task_log_info['task_joins'] = ",".join([str(t.tid) for t in task_record['joins']
+                                                    if isinstance(t, AppFuture) or isinstance(t, DataFuture)])
+        elif isinstance(task_record['joins'], Future):
+            task_log_info['task_joins'] = ",".join([str(t.tid) for t in [task_record['joins']]
+                                                    if isinstance(t, AppFuture) or isinstance(t, DataFuture)])
+
+        return task_log_info
 
     @property
     def provider(self):
