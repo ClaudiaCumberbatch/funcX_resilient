@@ -33,6 +33,7 @@ from globus_compute_sdk.errors import TaskExecutionFailed
 from globus_compute_sdk.sdk.asynchronous.compute_future import ComputeFuture
 from globus_compute_sdk.sdk.client import Client
 from globus_compute_sdk.sdk.utils import chunk_by
+from globus_compute_sdk.sdk.monitoring import monitor_wrapper
 from globus_compute_sdk.sdk.utils.uuid_like import (
     UUID_LIKE_T,
     as_optional_uuid,
@@ -124,6 +125,7 @@ class Executor(concurrent.futures.Executor):
         batch_size: int = 128,
         funcx_client: Client | None = None,
         amqp_port: int | None = None,
+        monitoring: bool = False,
         **kwargs,
     ):
         """
@@ -205,6 +207,8 @@ class Executor(concurrent.futures.Executor):
         )
         self._task_submitter.start()
         _REGISTERED_FXEXECUTORS[id(self)] = self
+
+        self.monitoring = monitoring
 
     def __repr__(self) -> str:
         name = self.__class__.__name__
@@ -420,6 +424,8 @@ class Executor(concurrent.futures.Executor):
             return function_id
 
         log.debug("Function not registered. Registering: %s", fn)
+        if self.monitoring:
+            fn = monitor_wrapper(fn)
         func_register_kwargs.pop("function", None)  # just to be sure
         reg_kwargs = {
             "function_name": fn.__name__,

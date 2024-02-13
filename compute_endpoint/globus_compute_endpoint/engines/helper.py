@@ -3,6 +3,7 @@ import os
 import time
 import typing as t
 import uuid
+import inspect
 
 from globus_compute_common import messagepack
 from globus_compute_common.messagepack.message_types import Result, Task, TaskTransition
@@ -55,7 +56,7 @@ def execute_task(
     try:
         _task, task_buffer = _unpack_messagebody(task_body)
         log.debug("executing task task_id='%s'", task_id)
-        result = _call_user_function(task_buffer, result_size_limit=result_size_limit)
+        result = _call_user_function(task_buffer, result_size_limit=result_size_limit, task_id=task_id)
         log.debug("Execution completed without exception")
         result_message = dict(task_id=task_id, data=result)
 
@@ -119,7 +120,7 @@ def _unpack_messagebody(message: bytes) -> t.Tuple[Task, str]:
 
 
 def _call_user_function(
-    task_buffer: str, result_size_limit: int, serializer=serializer
+    task_buffer: str, result_size_limit: int, task_id: uuid.UUID, serializer=serializer
 ) -> str:
     """Deserialize the buffer and execute the task.
     Parameters
@@ -136,6 +137,13 @@ def _call_user_function(
     if GC_TASK_TIMEOUT > 0.0:
         log.debug(f"Setting task timeout to GC_TASK_TIMEOUT={GC_TASK_TIMEOUT}s")
         f = timeout(f, GC_TASK_TIMEOUT)
+
+    # Check if task needs task_id (i.e for monitoring/resource monitoring)
+    # Would also be possible to just invoke monitoring here?
+    sig = inspect.signature(f, follow_wrapped=False)
+    if "_globus_compute_task_id" in sig.parameters:
+        kwargs["_globus_compute_task_id"] = str(task_id)
+
 
     result_data = f(*args, **kwargs)
     serialized_data = serializer.serialize(result_data)

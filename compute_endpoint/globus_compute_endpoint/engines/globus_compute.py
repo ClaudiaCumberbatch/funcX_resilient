@@ -16,6 +16,7 @@ from globus_compute_endpoint.engines.base import (
 )
 from globus_compute_endpoint.strategies import SimpleStrategy
 from parsl.executors.high_throughput.executor import HighThroughputExecutor
+from parsl.monitoring.message_type import MessageType
 
 logger = logging.getLogger(__name__)
 DOCKER_CMD_TEMPLATE = "docker run {options} -v {rundir}:{rundir} -t {image} {command}"
@@ -94,6 +95,7 @@ class GlobusComputeEngine(GlobusComputeEngineBase):
                 **kwargs,
             )
         self.executor = executor
+        self.monitoring = None
 
     @property
     def encrypted(self):
@@ -145,6 +147,7 @@ class GlobusComputeEngine(GlobusComputeEngineBase):
         endpoint_id: t.Optional[uuid.UUID] = None,
         run_dir: t.Optional[str] = None,
         results_passthrough: t.Optional[queue.Queue] = None,
+        run_id: t.Optional[str] = None,
         **kwargs,
     ):
         assert endpoint_id, "GCExecutor requires kwarg:endpoint_id at start"
@@ -173,9 +176,27 @@ class GlobusComputeEngine(GlobusComputeEngineBase):
             # Only update the default queue in GCExecutorBase if
             # a queue is passed in
             self.results_passthrough = results_passthrough
+
+        self.executor.run_id = run_id
+
+        if self.monitoring:
+            self.executor.hub_address = self.monitoring.hub_address
+            self.executor.hub_port = self.hub_port
+            assert self.executor.hub_address and self.executor.hub_port, "Monitoring requires both hub address and port"
+            self.executor.monitoring_hub_url = self.monitoring.monitoring_hub_url
+            self.executor.resource_monitoring_enabled = self.monitoring.resource_monitoring_enabled
+            self.executor.resource_monitoring_interval = self.monitoring.resource_monitoring_interval
+
         self.executor.start()
         if self.strategy:
             self.strategy.start(self)
+
+        if self.monitoring:
+            self._status = self.executor.status()
+            msg = self.executor.create_monitoring_info(self._status)
+            logger.debug("Sending message {} to hub from exeutor start".format(msg))
+            self.monitoring.send(MessageType.BLOCK_INFO, msg)
+
         self._status_report_thread.start()
 
     def _submit(
@@ -379,6 +400,22 @@ class GlobusComputeEngine(GlobusComputeEngineBase):
             },
         }
         task_status_deltas: t.Dict[str, t.List[TaskTransition]] = {}  # TODO
+
+        # TODO: Move this to the base engine
+        if self.monitoring:
+            previous_status = self._status
+            self._status = self.executor.status()
+            delta_status = {}
+            for block_id in self._status:
+                if block_id not in previous_status \
+                   or previous_status[block_id].state != self._status[block_id].state:
+                    delta_status[block_id] = self._status[block_id]
+
+            if delta_status:
+                msg = self.executor.create_monitoring_info(delta_status)
+                logger.debug("Sending message {} to hub from job status poller".format(msg))
+                self.monitoring.send(MessageType.BLOCK_INFO, msg)
+
         return EPStatusReport(
             endpoint_id=self.endpoint_id,
             global_state=executor_status,

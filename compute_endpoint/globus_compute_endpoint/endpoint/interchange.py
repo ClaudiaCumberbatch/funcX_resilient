@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import logging
 import multiprocessing
 import os
@@ -10,7 +11,12 @@ import signal
 import sys
 import threading
 import time
+from collections import defaultdict
 from concurrent.futures import Future
+from getpass import getuser
+from socket import gethostname
+from threading import Lock
+from uuid import uuid4
 
 # multiprocessing.Event is a method, not a class
 # to annotate, we need the "real" class
@@ -20,11 +26,12 @@ from multiprocessing.synchronize import Event as EventType
 import globus_compute_endpoint.endpoint.config
 import pika.exceptions
 import setproctitle
-from globus_compute_common.messagepack import InvalidMessageError, pack
+from globus_compute_common.messagepack import InvalidMessageError, pack, unpack
 from globus_compute_common.messagepack.message_types import (
     EPStatusReport,
     Result,
     ResultErrorDetails,
+    Task
 )
 from globus_compute_endpoint import __version__ as funcx_endpoint_version
 from globus_compute_endpoint.endpoint.rabbit_mq import (
@@ -32,9 +39,12 @@ from globus_compute_endpoint.endpoint.rabbit_mq import (
     TaskQueueSubscriber,
 )
 from globus_compute_endpoint.endpoint.result_store import ResultStore
+from globus_compute_endpoint.endpoint.timingrecord import TimingRecord
 from globus_compute_endpoint.engines.base import GlobusComputeEngineBase
 from globus_compute_endpoint.exception_handling import get_result_error_details
 from globus_compute_sdk import __version__ as funcx_sdk_version
+from parsl.dataflow.states import States, FINAL_STATES, FINAL_FAILURE_STATES
+from parsl.monitoring.message_type import MessageType
 from parsl.version import VERSION as PARSL_VERSION
 
 log = logging.getLogger(__name__)
@@ -134,12 +144,67 @@ class EndpointInterchange:
         self.executor: GlobusComputeEngineBase = self.config.executors[0]
         self._test_start = False
 
+        # Monitor
+        self.monitoring = self.config.monitoring_hub
+        self.hub_address = None
+        self.hub_interchange_port = None
+
+        if self.monitoring:
+            # Add run id for monitoring
+            self.run_id = str(uuid4())
+            self.timing_record_lock : Lock = Lock()
+            self.timing_records : dict[str, TimingRecord] = dict()
+            self.task_state_counts : dict[States, int] = defaultdict(int)
+        else:
+            self.run_id = None
+
+    def _init_monitoring(self):
+        #self.monitoring.logdir = self.logdir
+        self.hub_address = self.monitoring.hub_address
+        log.info("Starting monitoring hub")
+        self.hub_interchange_port = self.monitoring.start(self.run_id, str(self.logdir))
+
+        # Providing executor with monitoring information if it needs it
+        self.executor.monitoring = self.monitoring
+        self.executor.hub_port = self.hub_interchange_port
+
+        self.workflow_name = f"{self.endpoint_id}"
+        self.time_began = datetime.datetime.now()
+        self.workflow_version = str(self.time_began.replace(microsecond=0))
+
+        workflow_info = {
+                'python_version': "{}.{}.{}".format(sys.version_info.major,
+                                                    sys.version_info.minor,
+                                                    sys.version_info.micro),
+                'parsl_version': PARSL_VERSION,
+                "time_began": self.time_began,
+                'time_completed': None,
+                'run_id': self.run_id,
+                'workflow_name': self.workflow_name,
+                'workflow_version': self.workflow_version,
+                'rundir': str(self.endpoint_dir),
+                'tasks_completed_count': 0,
+                'tasks_failed_count': 0,
+                'user': getuser(),
+                'host': platform.node()
+        }
+
+        self.monitoring.send(MessageType.WORKFLOW_INFO,
+                                workflow_info)
+
     def start_engine(self):
         log.info("Starting Engine")
+
+        if self.monitoring:
+            self._init_monitoring()
+        else:
+            self.executor.monitoring = False
+
         self.executor.start(
             results_passthrough=self.results_passthrough,
             endpoint_id=self.endpoint_id,
             run_dir=self.logdir,
+            run_id=self.run_id
         )
 
     def migrate_tasks_to_internal(
@@ -203,6 +268,20 @@ class EndpointInterchange:
 
     def cleanup(self):
         self.executor.shutdown(block=True)
+        if self.monitoring:
+            log.info("Sending final monitoring message")
+            self.time_completed = datetime.datetime.now()
+            self.monitoring.send(MessageType.WORKFLOW_INFO,
+                                {'tasks_failed_count': self.task_state_counts[States.failed],
+                                'tasks_completed_count': self.task_state_counts[States.exec_done],
+                                "time_began": self.time_began,
+                                'time_completed': self.time_completed,
+                                'run_id': self.run_id, 'rundir': str(self.endpoint_dir),
+                                'exit_now': True})
+
+            log.info("Terminating monitoring")
+            self.monitoring.close()
+            log.info("Terminated monitoring")
 
     def handle_sigterm(self, sig_num, curr_stack_frame):
         log.warning("Received SIGTERM, setting termination flag.")
@@ -317,6 +396,69 @@ class EndpointInterchange:
 
         self._main_loop()
 
+    def _begin_task(self, task_id):
+        if self.monitoring:
+            timing_record: TimingRecord
+            timing_record = {
+                'time_invoked': datetime.datetime.now(),
+                'time_returned': None
+            }
+            with self.timing_record_lock:
+                self.timing_records[task_id] = timing_record
+            self._send_task_info(task_id, States.launched, timing_record)
+
+    def _complete_task(self, task_id, error_details : ResultErrorDetails | None):
+        if self.monitoring:
+            timing_record = self.timing_records[task_id]
+            timing_record['time_returned'] = datetime.datetime.now()
+
+            if error_details is not None:
+                self.task_state_counts[States.failed] += 1
+            else:
+                self.task_state_counts[States.exec_done] += 1
+
+            with self.timing_record_lock:
+                del self.timing_records[task_id]
+
+            self._send_task_info(task_id, States.launched, timing_record)
+
+    def _send_task_info(self, task_id, status, timing_record):
+        task_log_info = self._create_task_log_info(task_id, status, timing_record)
+        log.debug(f"Sending messaege: {task_log_info} to monitoring")
+        self.monitoring.send(MessageType.TASK_INFO, task_log_info)
+
+    def _create_task_log_info(self, task_id, status, timing_record):
+        task_log_info = {"task_" + k: timing_record[k] for k in ["time_invoked", "time_returned"]}
+        task_log_info["task_id"] = str(task_id)
+        task_log_info["task_func_name"] = None # Not available at interchange
+        task_log_info["task_status"] = status
+        task_log_info["task_try_time_launched"] = timing_record["time_invoked"]
+        task_log_info["task_try_time_returned"] = timing_record["time_returned"]
+        task_log_info["task_executor"] = self.executor.label
+        task_log_info['run_id'] = self.run_id
+        task_log_info['try_id'] = 0
+        task_log_info['timestamp'] = datetime.datetime.now()
+        task_log_info['task_status_name'] = status.name
+        task_log_info['tasks_failed_count'] = self.task_state_counts[States.failed]
+        task_log_info['tasks_completed_count'] = self.task_state_counts[States.exec_done]
+
+        # Fields not currently implemented in Globus Compute
+        task_log_info["task_memoize"] = False
+        task_log_info["task_hashsum"] = None
+        task_log_info["task_fail_count"] = 0 # TODO: Should this be 1 if the task failed?
+        task_log_info["task_fail_cost"] = 0
+        task_log_info['tasks_memo_completed_count'] = 0
+        task_log_info['from_memo'] = False
+        task_log_info['task_inputs'] = None
+        task_log_info['task_outputs'] = None
+        task_log_info['task_stdin'] = None
+        task_log_info['task_stdout'] = None 
+        task_log_info['task_stderr'] = None
+        task_log_info['task_fail_history'] = ""
+        task_log_info['task_depends'] = None
+        task_log_info['task_joins'] = None
+        return task_log_info
+
     def _main_loop(self):
         """
         This is the "kernel" of the endpoint interchange process.  Conceptually, there
@@ -373,6 +515,19 @@ class EndpointInterchange:
                 if self.time_to_quit:
                     self.stop()
                     continue  # nominally == break; but let event do it
+                
+                try:
+                    incoming_task = self.pending_task_queue.get(timeout=1)
+                    task_msg = unpack(incoming_task)
+                    if not isinstance(task_msg, Task):
+                        raise InvalidMessageError()
+                except queue.Empty:
+                    continue
+                except Exception:
+                    log.exception("Unhandled error processing incoming task")
+                    continue
+
+                self._begin_task(task_msg.task_id)
 
                 try:
                     prop_headers, body = self.pending_task_queue.get(timeout=1)
@@ -455,6 +610,7 @@ class EndpointInterchange:
                 try:
                     msg = self.results_passthrough.get(timeout=1)
                     packed_message: bytes = msg["message"]
+                    unpacked_message = unpack(packed_message)
                     task_id: str | None = msg.get("task_id")
 
                 except queue.Empty:
@@ -470,6 +626,9 @@ class EndpointInterchange:
                 if task_id:
                     num_results_forwarded += 1
                     log.debug("Forwarding result for task: %s", task_id)
+
+                    # Send results to monitoring
+                    self._complete_task(task_id, unpacked_message.error_details)
 
                 try:
                     f = results_publisher.publish(packed_message)
